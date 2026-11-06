@@ -1678,19 +1678,58 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      uint64_t saved_mode = 0;
      int r = sceFsTransactionSaveDataWriteParam(img, blob, sizeof(blob));
      if (r < 0) {
+         logprintf("[GarlicMgr] PS5PARAM: first write attempt failed (%d)\n", r);
          int en = ps5param_enable_blob_mode(img, &saved_mode);
          if (en == 1) {
              logprintf("[GarlicMgr] PS5PARAM: retrying blob write after enabling mode\n");
              r = sceFsTransactionSaveDataWriteParam(img, blob, sizeof(blob));
              if (r < 0) {
+                 /* Ioctl still fails — roll back mode to avoid ICV mismatch.
+                  * The ICV is computed by the PS5's hardware security processor
+                  * (SBL) and cannot be replicated in userspace, so leaving
+                  * modified header fields without a matching ICV would make the
+                  * PS5 mark the save as corrupted. */
+                 logprintf("[GarlicMgr] PS5PARAM: ioctl still fails (%d), "
+                           "rolling back header to avoid ICV mismatch\n", r);
                  int fd = open(img, O_RDWR);
                  if (fd >= 0) {
                      pwrite(fd, &saved_mode, 8, 0x368);
+                     fsync(fd);
                      close(fd);
+                     logprintf("[GarlicMgr] PS5PARAM: header rolled back "
+                               "(mode restored to 0x%016llx)\n",
+                               (unsigned long long)saved_mode);
                  }
              }
          }
      }
+
+     /* Mirror the blob to the file after successful ioctl.  The kernel's PFS
+      * controller keeps the written blob in its own memory and does NOT flush
+      * it to the on-disk image.  copy_file later reads from disk and would
+      * see stale (zeroed) data without this explicit pwrite. */
+     if (r == 0) {
+         logprintf("[GarlicMgr] PS5PARAM: ioctl OK, mirroring blob to file "
+                   "(magic=%02x%02x%02x%02x%02x%02x%02x%02x)\n",
+                   blob[0],blob[1],blob[2],blob[3],
+                   blob[4],blob[5],blob[6],blob[7]);
+         int fd = open(img, O_RDWR);
+         if (fd >= 0) {
+             ssize_t wr2 = pwrite(fd, blob, sizeof(blob), 0xC00);
+             fsync(fd);
+             close(fd);
+             if (wr2 == (ssize_t)sizeof(blob))
+                 logprintf("[GarlicMgr] PS5PARAM: mirrored blob to file at "
+                           "0xC00 (0x%x bytes)\n", (unsigned)sizeof(blob));
+             else
+                 logprintf("[GarlicMgr] PS5PARAM: mirror pwrite failed "
+                           "(wrote %zd, errno=%d)\n", wr2, errno);
+         } else {
+             logprintf("[GarlicMgr] PS5PARAM: mirror open(%s) failed "
+                       "errno=%d\n", img, errno);
+         }
+     }
+
      return r;
  }
 
