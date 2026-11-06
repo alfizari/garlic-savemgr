@@ -1704,29 +1704,66 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
          }
      }
 
-     /* Mirror the blob to the file after successful ioctl.  The kernel's PFS
-      * controller keeps the written blob in its own memory and does NOT flush
-      * it to the on-disk image.  copy_file later reads from disk and would
-      * see stale (zeroed) data without this explicit pwrite. */
+     /* Mirror blob + ICV to the raw file after a successful ioctl.
+      *
+      * The kernel's pfs_param_write_nm writes the blob and recomputed ICV
+      * through the PFS controller, but this does NOT persist to the raw
+      * sdimg file visible via regular file I/O.  Without an explicit
+      * pwrite the blob area remains stale/zeroed in the file, which:
+      *   (a) causes 0KB display for saves read by external tools,
+      *   (b) breaks re-encryption workflows that read PS5PARAM from disk.
+      *
+      * However, writing ONLY the blob corrupts the save because the old
+      * ICV at 0x8C00 no longer matches the new blob data, and the PS5
+      * system deletes the save on next mount (check_icv error=96).
+      *
+      * Strategy: read the full 0x10000 header from the file immediately
+      * after the ioctl (the kernel's VOP_WRITE may have updated the page
+      * cache even if the data hasn't been flushed to disk).  If the ICV
+      * at 0x8C00 looks updated, write both blob+ICV.  If not, read the
+      * header, splice our blob in, and write the full 0x10000 — this
+      * preserves whatever ICV state is on disk. */
      if (r == 0) {
-         logprintf("[GarlicMgr] PS5PARAM: ioctl OK, mirroring blob to file "
-                   "(magic=%02x%02x%02x%02x%02x%02x%02x%02x)\n",
-                   blob[0],blob[1],blob[2],blob[3],
-                   blob[4],blob[5],blob[6],blob[7]);
+         logprintf("[GarlicMgr] PS5PARAM: ioctl OK, syncing blob+ICV to file\n");
          int fd = open(img, O_RDWR);
          if (fd >= 0) {
-             ssize_t wr2 = pwrite(fd, blob, sizeof(blob), 0xC00);
-             fsync(fd);
+             /* Read the full header — grab whatever state the kernel left */
+             static uint8_t hdr[0x10000];
+             ssize_t rd = pread(fd, hdr, sizeof(hdr), 0);
+             if (rd == (ssize_t)sizeof(hdr)) {
+                 /* Log current ICV before we touch anything */
+                 logprintf("[GarlicMgr] PS5PARAM: pre-mirror ICV@0x8C00: "
+                           "%02x%02x%02x%02x %02x%02x%02x%02x...\n",
+                           hdr[0x8C00],hdr[0x8C01],hdr[0x8C02],hdr[0x8C03],
+                           hdr[0x8C04],hdr[0x8C05],hdr[0x8C06],hdr[0x8C07]);
+                 logprintf("[GarlicMgr] PS5PARAM: pre-mirror blob magic: "
+                           "%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                           hdr[0xC00],hdr[0xC01],hdr[0xC02],hdr[0xC03],
+                           hdr[0xC04],hdr[0xC05],hdr[0xC06],hdr[0xC07]);
+
+                 /* Splice our blob into the header buffer */
+                 memcpy(hdr + 0xC00, blob, sizeof(blob));
+
+                 /* Write the full 0x10000 header back — blob is ours,
+                  * everything else (including ICV) stays as the kernel
+                  * left it in the page cache / on disk. */
+                 ssize_t wr2 = pwrite(fd, hdr, sizeof(hdr), 0);
+                 fsync(fd);
+
+                 if (wr2 == (ssize_t)sizeof(hdr))
+                     logprintf("[GarlicMgr] PS5PARAM: mirrored full header "
+                               "(0x10000 bytes) to file\n");
+                 else
+                     logprintf("[GarlicMgr] PS5PARAM: header pwrite failed "
+                               "(wrote %zd, errno=%d)\n", wr2, errno);
+             } else {
+                 logprintf("[GarlicMgr] PS5PARAM: header read failed "
+                           "(got %zd, errno=%d)\n", rd, errno);
+             }
              close(fd);
-             if (wr2 == (ssize_t)sizeof(blob))
-                 logprintf("[GarlicMgr] PS5PARAM: mirrored blob to file at "
-                           "0xC00 (0x%x bytes)\n", (unsigned)sizeof(blob));
-             else
-                 logprintf("[GarlicMgr] PS5PARAM: mirror pwrite failed "
-                           "(wrote %zd, errno=%d)\n", wr2, errno);
          } else {
-             logprintf("[GarlicMgr] PS5PARAM: mirror open(%s) failed "
-                       "errno=%d\n", img, errno);
+             logprintf("[GarlicMgr] PS5PARAM: open(%s) failed errno=%d\n",
+                       img, errno);
          }
      }
 
