@@ -151,7 +151,8 @@
  static uint8_t g_mount_real_sfo[0x8000];
  static uint32_t g_mount_real_sfo_len = 0;
  static const char *g_zip_extra_image = NULL;
- 
+ static uint64_t g_last_decrypt_imgsize = 0;  /* original sdimg size from last decrypt */
+
  /* ── Server-side editor buffer ─────────────────────────────────── */
  static char  g_ed_name[512] = {0};   /* file path relative to mount */
  static char *g_ed_buf = NULL;        /* file contents in memory */
@@ -1739,6 +1740,16 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      uint8_t ckey[0x20] = {0};
      int ret;
 
+     /* Capture original image size before we touch anything */
+     uint64_t original_img_size = 0;
+     {
+         struct stat orig_st;
+         if (stat(img, &orig_st) == 0)
+             original_img_size = (uint64_t)orig_st.st_size;
+     }
+     logprintf("[GarlicMgr] recreate: source=%s orig_size=%llu sfo_sz=%u\n",
+               img, (unsigned long long)original_img_size, sfo_sz);
+
      /* Elevate privileges */
      pid_t rpid = getpid();
      kernel_set_ucred_uid(rpid, 0);
@@ -1834,15 +1845,40 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      /* Unmount source */
      unmount_save();
 
-     /* Size the new image: at least as big as original */
+     /* Size the new image: honour SAVEDATA_BLOCKS from param.sfo first,
+      * then fall back to data-based estimate, then original file size. */
      uint64_t img_size = total_size + (total_size / 4) + (4 * 1024 * 1024);
      if (img_size < 32 * 1024 * 1024) img_size = 32 * 1024 * 1024;
+
+     /* Use SAVEDATA_BLOCKS from the SFO (provided or extracted) as floor */
      {
-         struct stat orig_st;
-         if (stat(img, &orig_st) == 0 && (uint64_t)orig_st.st_size > img_size)
-             img_size = (uint64_t)orig_st.st_size;
+         sfo_info_t sfo_info;
+         memset(&sfo_info, 0, sizeof(sfo_info));
+         int got_blocks = 0;
+         if (sfo && sfo_sz > 0 && parse_sfo_mem(sfo, sfo_sz, &sfo_info) == 0 && sfo_info.blocks > 0)
+             got_blocks = 1;
+         if (!got_blocks) {
+             char pfs_sfo_path[MAX_PATH_LEN];
+             snprintf(pfs_sfo_path, sizeof(pfs_sfo_path), "%s/sce_sys/param.sfo", extract_dir);
+             if (parse_sfo(pfs_sfo_path, &sfo_info) == 0 && sfo_info.blocks > 0)
+                 got_blocks = 1;
+         }
+         if (got_blocks) {
+             uint64_t blocks_size = (uint64_t)sfo_info.blocks * 65536;
+             if (blocks_size > img_size)
+                 img_size = blocks_size;
+             logprintf("[GarlicMgr] recreate: SAVEDATA_BLOCKS=%u -> container %llu bytes\n",
+                       sfo_info.blocks, (unsigned long long)img_size);
+         }
      }
+
+     /* Use the original image size (captured at entry) as a floor */
+     if (original_img_size > img_size)
+         img_size = original_img_size;
      img_size = ((img_size + 32767) / 32768) * 32768;
+     logprintf("[GarlicMgr] recreate: final container size=%llu total_data=%llu orig=%llu\n",
+               (unsigned long long)img_size, (unsigned long long)total_size,
+               (unsigned long long)original_img_size);
 
      /* Create new image */
      unlink(new_img);
@@ -2465,6 +2501,126 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      return ret;
  }
  
+ /* Patch SAVEDATA_BLOCKS in an SFO file on disk.
+  * If the field exists, update it in place.  If not, append a new entry.
+  * Returns 0 on success. */
+ static int sfo_patch_blocks(const char *path, uint32_t blocks) {
+     int fd = open(path, O_RDONLY);
+     if (fd < 0) return -1;
+     struct stat st;
+     if (fstat(fd, &st) < 0 || st.st_size < 20 || st.st_size > 0x10000) {
+         close(fd); return -1;
+     }
+     size_t fsz = (size_t)st.st_size;
+     uint8_t *buf = malloc(fsz + 256); /* extra room for new entry */
+     if (!buf) { close(fd); return -1; }
+     if (read(fd, buf, fsz) != (ssize_t)fsz) { free(buf); close(fd); return -1; }
+     close(fd);
+
+     /* Validate SFO header */
+     if (buf[0] != 0x00 || buf[1] != 0x50 || buf[2] != 0x53 || buf[3] != 0x46) {
+         free(buf); return -1;
+     }
+     uint32_t key_off, data_off, n_entries;
+     memcpy(&key_off, buf + 8, 4);
+     memcpy(&data_off, buf + 12, 4);
+     memcpy(&n_entries, buf + 16, 4);
+
+     /* Search for existing SAVEDATA_BLOCKS */
+     for (uint32_t i = 0; i < n_entries; i++) {
+         uint8_t *idx = buf + 20 + i * 16;
+         uint16_t koff; memcpy(&koff, idx, 2);
+         uint64_t kpos = (uint64_t)key_off + koff;
+         if (kpos >= fsz) continue;
+         const char *key = (const char *)(buf + kpos);
+         if (strcmp(key, "SAVEDATA_BLOCKS") == 0) {
+             /* Found — update value in place */
+             uint32_t doff; memcpy(&doff, idx + 12, 4);
+             uint64_t vpos = (uint64_t)data_off + doff;
+             /* SAVEDATA_BLOCKS is uint64 (8 bytes) */
+             if (vpos + 8 <= fsz) {
+                 uint64_t val = (uint64_t)blocks;
+                 memcpy(buf + vpos, &val, 8);
+                 /* Write back */
+                 fd = open(path, O_WRONLY | O_TRUNC);
+                 if (fd < 0) { free(buf); return -1; }
+                 write(fd, buf, fsz);
+                 close(fd);
+                 free(buf);
+                 return 0;
+             }
+             free(buf); return -1;
+         }
+     }
+
+     /* SAVEDATA_BLOCKS not found — add a new entry.
+      * This requires expanding the index table (shifting key+data tables)
+      * and appending the key and data. */
+     size_t new_key_len = strlen("SAVEDATA_BLOCKS") + 1; /* 16 bytes incl NUL */
+     size_t new_data_len = 8; /* uint64 */
+     size_t idx_expand = 16; /* one new index entry */
+
+     /* Current key table content */
+     size_t key_table_len = data_off - key_off;
+     size_t data_table_len = fsz - data_off;
+
+     /* New layout */
+     uint32_t new_key_off = key_off + (uint32_t)idx_expand;
+     uint32_t new_data_off = new_key_off + (uint32_t)key_table_len + (uint32_t)new_key_len;
+     /* Align data_off to 4 bytes */
+     new_data_off = (new_data_off + 3) & ~3u;
+
+     size_t new_fsz = new_data_off + data_table_len + new_data_len;
+     uint8_t *out = calloc(1, new_fsz);
+     if (!out) { free(buf); return -1; }
+
+     /* Copy header */
+     memcpy(out, buf, 20);
+     /* Update header fields */
+     uint32_t new_n = n_entries + 1;
+     memcpy(out + 8, &new_key_off, 4);
+     memcpy(out + 12, &new_data_off, 4);
+     memcpy(out + 16, &new_n, 4);
+
+     /* Copy existing index entries, updating key_off and data_off references */
+     for (uint32_t i = 0; i < n_entries; i++) {
+         memcpy(out + 20 + i * 16, buf + 20 + i * 16, 16);
+     }
+
+     /* Add new index entry for SAVEDATA_BLOCKS at sorted position (append) */
+     uint8_t *new_idx = out + 20 + n_entries * 16;
+     uint16_t new_koff = (uint16_t)key_table_len; /* after existing keys */
+     memcpy(new_idx + 0, &new_koff, 2);
+     uint16_t fmt = 0x0404; /* binary uint64 */
+     memcpy(new_idx + 2, &fmt, 2);
+     uint32_t plen = 8; /* param_len = used size */
+     memcpy(new_idx + 4, &plen, 4);
+     uint32_t pmaxlen = 8; /* param_maxlen */
+     memcpy(new_idx + 8, &pmaxlen, 4);
+     uint32_t new_doff = (uint32_t)data_table_len; /* after existing data */
+     memcpy(new_idx + 12, &new_doff, 4);
+
+     /* Copy existing key table */
+     memcpy(out + new_key_off, buf + key_off, key_table_len);
+     /* Append new key */
+     memcpy(out + new_key_off + key_table_len, "SAVEDATA_BLOCKS", new_key_len);
+
+     /* Copy existing data table */
+     memcpy(out + new_data_off, buf + data_off, data_table_len);
+     /* Append new data (uint64 blocks value) */
+     uint64_t val = (uint64_t)blocks;
+     memcpy(out + new_data_off + data_table_len, &val, 8);
+
+     /* Write back */
+     fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+     if (fd < 0) { free(out); free(buf); return -1; }
+     write(fd, out, new_fsz);
+     close(fd);
+     free(out);
+     free(buf);
+     return 0;
+ }
+
  /* Prefer an exact PS4 template, then try the user's other local saves.
   * Read a disposable image copy on a separate mount; never write the donor. */
  static int patch_local_sfo_owner(const char *path, const uint8_t account[8],
@@ -6639,11 +6795,21 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              http_json(sock, json); return;
          }
  
+         /* Remember original image size for re-encrypt container sizing */
+         {
+             struct stat dec_st;
+             if (stat(tmp, &dec_st) == 0)
+                 g_last_decrypt_imgsize = (uint64_t)dec_st.st_size;
+             else
+                 g_last_decrypt_imgsize = received;
+         }
+
          /* Mount succeeded — install the real param.sfo from the PS5PARAM blob
           * into the PFS so the decrypted zip contains usable metadata.
           * Without this the zip gets a zeroed param.sfo that breaks re-encrypt. */
-         char sfo_path[MAX_PATH_LEN], json[256];
+         char sfo_path[MAX_PATH_LEN], json[512];
          sfo_info_t sfo;
+         memset(&sfo, 0, sizeof(sfo));
          snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
          if (!is_ps4_dec && g_mount_real_sfo_len &&
              sfo_bytes_valid(g_mount_real_sfo, g_mount_real_sfo_len)) {
@@ -6654,13 +6820,28 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          } else {
              parse_sfo(sfo_path, &sfo);
          }
+         /* If SAVEDATA_BLOCKS is missing/zero, derive it from the original image
+          * size and patch it into the PFS param.sfo so re-encrypt gets the right
+          * container size. */
+         if (!is_ps4_dec && sfo.blocks == 0 && g_last_decrypt_imgsize > 0) {
+             uint32_t derived_blocks = (uint32_t)(g_last_decrypt_imgsize / 65536);
+             if (derived_blocks > 0) {
+                 sfo_patch_blocks(sfo_path, derived_blocks);
+                 sync();
+                 sfo.blocks = derived_blocks;
+                 logprintf("[GarlicMgr] decrypt: patched SAVEDATA_BLOCKS=%u into %s\n",
+                           derived_blocks, sfo_path);
+             }
+         }
+
          /* Only include a safe title ID; missing/zeroed SFOs can still be downloaded. */
          if (strlen(sfo.title_id) != 9 ||
              (strncmp(sfo.title_id, "CUSA", 4) != 0 && strncmp(sfo.title_id, "PPSA", 4) != 0) ||
              strspn(sfo.title_id + 4, "0123456789") != 5)
              sfo.title_id[0] = '\0';
          snprintf(json, sizeof(json),
-                  "{\"ok\":true,\"download\":\"/api/download\",\"title_id\":\"%s\"}", sfo.title_id);
+                  "{\"ok\":true,\"download\":\"/api/download\",\"title_id\":\"%s\",\"blocks\":%u,\"img_size\":%llu}",
+                  sfo.title_id, sfo.blocks, (unsigned long long)g_last_decrypt_imgsize);
          http_json(sock, json);
          return;
      }
@@ -7313,8 +7494,24 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                      img_size = 32 * 1024 * 1024;
              }
          }
+
+         /* Parse optional blocks= parameter (SAVEDATA_BLOCKS from param.sfo) */
+         char *bp = strstr(url, "blocks=");
+         if (bp) {
+             uint64_t req_blocks = strtoull(bp + 7, NULL, 10);
+             if (req_blocks > 0) {
+                 uint64_t blocks_size = req_blocks * 65536;
+                 if (blocks_size > img_size)
+                     img_size = blocks_size;
+             }
+         }
+
+         /* Fall back to the original image size from the last decrypt */
+         if (g_last_decrypt_imgsize > img_size)
+             img_size = g_last_decrypt_imgsize;
+
          img_size = ((img_size + 32767) / 32768) * 32768;
- 
+
          mkdir("/data/save_files", 0777);
          const char *tmp = "/data/save_files/_tmp_enc";
          unlink(tmp);
@@ -7549,13 +7746,34 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          snprintf(tmp_path, sizeof(tmp_path), "%s", g_mounted_path);
          unmount_save();
 
-         /* PS5: recreate container without blob */
-         if (!g_enc_ps4 && dl_sfo_len && g_mount_real_sfo_len) {
-             int rc = recreate_container_no_blob(tmp_path, dl_sfo, dl_sfo_len);
-             if (rc < 0)
-                 logprintf("[GarlicMgr] WARNING: download_new recreate failed (%d)\n", rc);
-             else
-                 logprintf("[GarlicMgr] download_new: recreated container without blob\n");
+         /* PS5: recreate container when the blob needs removing OR when the
+          * current container is too small for SAVEDATA_BLOCKS. */
+         if (!g_enc_ps4 && dl_sfo_len) {
+             int need_recreate = 0;
+             if (g_mount_real_sfo_len) {
+                 need_recreate = 1; /* had blob → must strip it */
+             } else {
+                 /* No blob, but check if container is undersized for SAVEDATA_BLOCKS */
+                 sfo_info_t dl_info;
+                 memset(&dl_info, 0, sizeof(dl_info));
+                 if (parse_sfo_mem(dl_sfo, dl_sfo_len, &dl_info) == 0 && dl_info.blocks > 0) {
+                     uint64_t want = (uint64_t)dl_info.blocks * 65536;
+                     struct stat cur_st;
+                     if (stat(tmp_path, &cur_st) == 0 && (uint64_t)cur_st.st_size < want) {
+                         need_recreate = 1;
+                         logprintf("[GarlicMgr] download_new: container %llu < blocks %u (%llu), recreating\n",
+                                   (unsigned long long)cur_st.st_size, dl_info.blocks,
+                                   (unsigned long long)want);
+                     }
+                 }
+             }
+             if (need_recreate) {
+                 int rc = recreate_container_no_blob(tmp_path, dl_sfo, dl_sfo_len);
+                 if (rc < 0)
+                     logprintf("[GarlicMgr] WARNING: download_new recreate failed (%d)\n", rc);
+                 else
+                     logprintf("[GarlicMgr] download_new: recreated container without blob\n");
+             }
          }
 
          /* For PS4: write sealed key .bin companion file */
