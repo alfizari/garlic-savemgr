@@ -7115,7 +7115,6 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
         int files = extract_zip(g_mount_point, tar_data, received);
         free(tar_data);
         int preserve_sidecar = 0;
-        int has_ps5param_sidecar = 0;
         int upload_zero_sfo = 0;
         {
             char root_sfo[MAX_PATH_LEN];
@@ -7124,8 +7123,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
             struct stat pst;
             if (stat("/data/save_files/_ps5param_sidecar", &pst) == 0 &&
                 pst.st_size == 0x8000 && preserved_size) {
-                has_ps5param_sidecar = 1;
-                preserve_sidecar = upload_zero_sfo;
+                /* Always restore the original blob when the sidecar exists.
+                 * The PS5 needs the blob for validation — recreating without
+                 * it produces a zero sealed key that causes CE-107136-8. */
+                preserve_sidecar = 1;
             }
             if (upload_zero_sfo && (!preserve_sidecar || !use_original)) {
                 unmount_save();
@@ -7168,7 +7169,6 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          /* Optional: patch account ID in param.sfo */
          char *ap = strstr(url, "aid=");
          if (ap) {
-            if (!upload_zero_sfo) preserve_sidecar = 0;
              char aid_hex[64] = {0};
              strncpy(aid_hex, ap + 4, sizeof(aid_hex) - 1);
              char *rp2 = aid_hex, *wp2 = aid_hex;
@@ -7213,8 +7213,11 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  
          unmount_save();
  
-         /* Restore or update PS5PARAM only when the original save had one.
-          * Regular saves keep their metadata solely in the mounted PFS. */
+         /* Restore original PS5PARAM blob when the save had one.
+          * The blob contains the sealed key and crypto-authenticated metadata
+          * that the PS5 validates during RestoreBackupData.  Recreating the
+          * container without the blob (PprCreate + zero key) causes the PS5
+          * to reject the save with CE-107136-8 (0x809F800A). */
          if (preserve_sidecar) {
             int wr = ps5param_restore_blob(tmp, "/data/save_files/_ps5param_sidecar");
             if (wr < 0) {
@@ -7222,15 +7225,14 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                 http_json(sock, "{\"error\":\"Failed to restore original PS5PARAM blob\"}");
                 return;
             }
-            logprintf("[GarlicMgr] PS5PARAM: restored original encrypted blob for zeroed param.sfo\n");
-        } else if (has_ps5param_sidecar && enc_blob_sfo_len) {
-             /* Blob write would corrupt the SBL-authenticated region.
-              * Recreate the container without a blob so PS5 reads SFO from PFS. */
-             int rc = recreate_container_no_blob(tmp, enc_blob_sfo, enc_blob_sfo_len);
-             if (rc < 0)
-                 logprintf("[GarlicMgr] WARNING: encrypt recreate failed (%d)\n", rc);
-             else
-                 logprintf("[GarlicMgr] encrypt_upload: recreated container without blob\n");
+            /* Update the SFO inside the restored blob when the PFS copy was
+             * modified (e.g. account ID patch) so both copies stay in sync. */
+            if (enc_blob_sfo_len && !upload_zero_sfo) {
+                ps5param_write_sfo(tmp, enc_blob_sfo, enc_blob_sfo_len);
+                logprintf("[GarlicMgr] PS5PARAM: restored blob + updated SFO inside it\n");
+            } else {
+                logprintf("[GarlicMgr] PS5PARAM: restored original blob as-is\n");
+            }
          }
  
          struct stat est;
@@ -7746,33 +7748,43 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          snprintf(tmp_path, sizeof(tmp_path), "%s", g_mounted_path);
          unmount_save();
 
-         /* PS5: recreate container when the blob needs removing OR when the
-          * current container is too small for SAVEDATA_BLOCKS. */
+         /* PS5: restore original blob when the save had one, or recreate
+          * when the container is undersized for SAVEDATA_BLOCKS.
+          * Restoring the blob preserves the sealed key and crypto metadata
+          * the PS5 needs during RestoreBackupData — without it the PS5
+          * rejects the save with CE-107136-8 (0x809F800A). */
          if (!g_enc_ps4 && dl_sfo_len) {
-             int need_recreate = 0;
-             if (g_mount_real_sfo_len) {
-                 need_recreate = 1; /* had blob → must strip it */
-             } else {
-                 /* No blob, but check if container is undersized for SAVEDATA_BLOCKS */
+             struct stat pst;
+             int has_sidecar = (stat("/data/save_files/_ps5param_sidecar", &pst) == 0 &&
+                                pst.st_size == 0x8000);
+             if (g_mount_real_sfo_len && has_sidecar) {
+                 /* Restore the original blob — it has the authentic sealed key */
+                 int wr = ps5param_restore_blob(tmp_path, "/data/save_files/_ps5param_sidecar");
+                 if (wr < 0)
+                     logprintf("[GarlicMgr] WARNING: download_new blob restore failed\n");
+                 else {
+                     /* Update the SFO inside the blob to match PFS edits */
+                     ps5param_write_sfo(tmp_path, dl_sfo, dl_sfo_len);
+                     logprintf("[GarlicMgr] download_new: restored blob + updated SFO\n");
+                 }
+             } else if (!g_mount_real_sfo_len) {
+                 /* No blob originally, but check if container is undersized */
                  sfo_info_t dl_info;
                  memset(&dl_info, 0, sizeof(dl_info));
                  if (parse_sfo_mem(dl_sfo, dl_sfo_len, &dl_info) == 0 && dl_info.blocks > 0) {
                      uint64_t want = (uint64_t)dl_info.blocks * 65536;
                      struct stat cur_st;
                      if (stat(tmp_path, &cur_st) == 0 && (uint64_t)cur_st.st_size < want) {
-                         need_recreate = 1;
                          logprintf("[GarlicMgr] download_new: container %llu < blocks %u (%llu), recreating\n",
                                    (unsigned long long)cur_st.st_size, dl_info.blocks,
                                    (unsigned long long)want);
+                         int rc = recreate_container_no_blob(tmp_path, dl_sfo, dl_sfo_len);
+                         if (rc < 0)
+                             logprintf("[GarlicMgr] WARNING: download_new recreate failed (%d)\n", rc);
+                         else
+                             logprintf("[GarlicMgr] download_new: recreated container (no blob, size fix)\n");
                      }
                  }
-             }
-             if (need_recreate) {
-                 int rc = recreate_container_no_blob(tmp_path, dl_sfo, dl_sfo_len);
-                 if (rc < 0)
-                     logprintf("[GarlicMgr] WARNING: download_new recreate failed (%d)\n", rc);
-                 else
-                     logprintf("[GarlicMgr] download_new: recreated container without blob\n");
              }
          }
 
