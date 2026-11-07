@@ -1500,6 +1500,29 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      return result;
  }
  
+ /* ── Recursive directory removal ────────────────────────────────── */
+ static int remove_dir_recursive(const char *path) {
+     DIR *d = opendir(path);
+     if (!d) return -1;
+     struct dirent *ent;
+     while ((ent = readdir(d))) {
+         if (ent->d_name[0] == '.' &&
+             (ent->d_name[1] == 0 || (ent->d_name[1] == '.' && ent->d_name[2] == 0)))
+             continue;
+         char fp[MAX_PATH_LEN];
+         snprintf(fp, sizeof(fp), "%s/%s", path, ent->d_name);
+         struct stat st;
+         if (stat(fp, &st) < 0) continue;
+         if (S_ISDIR(st.st_mode))
+             remove_dir_recursive(fp);
+         else
+             unlink(fp);
+     }
+     closedir(d);
+     rmdir(path);
+     return 0;
+ }
+
  /* ── Recursive directory copy ───────────────────────────────────── */
  static int copy_dir_recursive(const char *src, const char *dst) {
      mkdir(dst, 0777);
@@ -1693,6 +1716,201 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
          }
      }
      return r;
+ }
+
+ /* Forward declarations for recreate_container_no_blob */
+ static int unmount_save(void);
+ static int install_sfo_file(const char *path, const uint8_t *buf, uint32_t len);
+
+ /* Recreate a PS5 save container in-place to eliminate the PS5PARAM blob.
+  * The old image at 'img' is replaced by a fresh container (mode=0x00)
+  * with the same PFS contents but no blob, so the PS5 reads param.sfo
+  * directly from the PFS. The 'sfo' buffer (if non-NULL) is installed
+  * as the PFS param.sfo before the new container is sealed.
+  * Returns 0 on success, <0 on error. */
+ static int recreate_container_no_blob(const char *img,
+                                        const uint8_t *sfo, uint32_t sfo_sz) {
+     if (!img || !img[0]) return -1;
+
+     /* We need to unmount any current save, mount the source, extract,
+      * create new, mount new, copy, and unmount. */
+     const char *extract_dir = "/data/save_files/_tmp_recreate_extract";
+     const char *new_img = "/data/save_files/_tmp_recreate_new";
+     uint8_t ckey[0x20] = {0};
+     int ret;
+
+     /* Elevate privileges */
+     pid_t rpid = getpid();
+     kernel_set_ucred_uid(rpid, 0);
+     kernel_set_ucred_authid(rpid, 0x4800000000000010ULL);
+
+     /* Mount the source image */
+     if (g_mounted) unmount_save();
+     snprintf(g_mount_point, sizeof(g_mount_point), "/data/mount_sd");
+     mkdir(g_mount_point, 0777);
+
+     /* Unseal the key at offset 0x800 */
+     uint8_t *kbuf = malloc(0x100);
+     if (!kbuf) return -1;
+     memset(kbuf, 0, 0x100);
+     {
+         int ifd = open(img, O_RDONLY);
+         if (ifd < 0) { free(kbuf); return -1; }
+         pread(ifd, kbuf, 0x60, 0x800);
+         close(ifd);
+     }
+     int pfsmgr = open("/dev/pfsmgr", O_RDWR);
+     if (pfsmgr < 0) { free(kbuf); return -1; }
+     ret = ioctl(pfsmgr, 0xc0845302, kbuf);
+     close(pfsmgr);
+     if (ret < 0) { free(kbuf); return -1; }
+     memcpy(ckey, kbuf + 0x60, 0x20);
+     free(kbuf);
+
+     MountOpt mopt;
+     memset(&mopt, 0, sizeof(mopt));
+     sceFsInitMountSaveDataOpt(&mopt);
+     mopt.budgetid = "system";
+     signal(SIGPIPE, SIG_DFL);
+     ret = sceFsMountSaveData(&mopt, img, g_mount_point, ckey);
+     signal(SIGPIPE, SIG_IGN);
+     if (ret < 0) {
+         logprintf("[GarlicMgr] recreate: mount source failed 0x%x\n", ret);
+         return -1;
+     }
+     snprintf(g_mounted_path, sizeof(g_mounted_path), "%s", img);
+     g_local_copy[0] = 0;
+     g_mounted = 1;
+
+     /* Install the resigned SFO into the PFS before extracting */
+     if (sfo && sfo_sz > 0) {
+         char pfs_sfo[MAX_PATH_LEN];
+         snprintf(pfs_sfo, sizeof(pfs_sfo), "%s/sce_sys/param.sfo", g_mount_point);
+         install_sfo_file(pfs_sfo, sfo, sfo_sz);
+         sync();
+     }
+
+     /* Extract all files */
+     remove_dir_recursive(extract_dir);
+     mkdir(extract_dir, 0777);
+     copy_dir_recursive(g_mount_point, extract_dir);
+     sync();
+
+     /* Calculate total size */
+     uint64_t total_size = 0;
+     {
+         DIR *sd = opendir(extract_dir);
+         if (sd) {
+             struct dirent *se;
+             while ((se = readdir(sd))) {
+                 if (se->d_name[0] == '.') continue;
+                 char fp[MAX_PATH_LEN];
+                 snprintf(fp, sizeof(fp), "%s/%s", extract_dir, se->d_name);
+                 struct stat fst;
+                 if (stat(fp, &fst) == 0) {
+                     if (S_ISDIR(fst.st_mode)) {
+                         DIR *sub = opendir(fp);
+                         if (sub) {
+                             struct dirent *sse;
+                             while ((sse = readdir(sub))) {
+                                 if (sse->d_name[0] == '.') continue;
+                                 char sfp[MAX_PATH_LEN];
+                                 snprintf(sfp, sizeof(sfp), "%s/%s", fp, sse->d_name);
+                                 struct stat sfst;
+                                 if (stat(sfp, &sfst) == 0) total_size += sfst.st_size;
+                             }
+                             closedir(sub);
+                         }
+                     } else {
+                         total_size += fst.st_size;
+                     }
+                 }
+             }
+             closedir(sd);
+         }
+     }
+     if (total_size == 0) total_size = 1024 * 1024;
+
+     /* Unmount source */
+     unmount_save();
+
+     /* Size the new image: at least as big as original */
+     uint64_t img_size = total_size + (total_size / 4) + (4 * 1024 * 1024);
+     if (img_size < 32 * 1024 * 1024) img_size = 32 * 1024 * 1024;
+     {
+         struct stat orig_st;
+         if (stat(img, &orig_st) == 0 && (uint64_t)orig_st.st_size > img_size)
+             img_size = (uint64_t)orig_st.st_size;
+     }
+     img_size = ((img_size + 32767) / 32768) * 32768;
+
+     /* Create new image */
+     unlink(new_img);
+     int imgfd = open(new_img, O_CREAT | O_TRUNC | O_RDWR, 0777);
+     if (imgfd < 0) goto cleanup_extract;
+     ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0, 0);
+     if (ret < 0 && ftruncate(imgfd, img_size) < 0) {
+         close(imgfd); unlink(new_img); goto cleanup_extract;
+     }
+     close(imgfd);
+
+     /* Format with PprCreate (zero key, no blob) */
+     memset(ckey, 0, sizeof(ckey));
+     if (!g_pprCreate) { unlink(new_img); goto cleanup_extract; }
+     {
+         CreateOpt copt;
+         memset(&copt, 0, sizeof(copt));
+         sceFsInitCreatePfsSaveDataOpt(&copt);
+         copt.flags[1] = 0;
+         ret = g_pprCreate(&copt, new_img, 0, img_size, ckey);
+     }
+     if (ret < 0) {
+         logprintf("[GarlicMgr] recreate: PprCreate failed 0x%x\n", ret);
+         unlink(new_img); goto cleanup_extract;
+     }
+
+     /* Mount new container */
+     snprintf(g_mount_point, sizeof(g_mount_point), "/data/mount_sd");
+     mkdir(g_mount_point, 0777);
+     memset(&mopt, 0, sizeof(mopt));
+     sceFsInitMountSaveDataOpt(&mopt);
+     mopt.budgetid = "system";
+     signal(SIGPIPE, SIG_DFL);
+     ret = sceFsMountSaveData(&mopt, new_img, g_mount_point, ckey);
+     signal(SIGPIPE, SIG_IGN);
+     if (ret < 0) {
+         logprintf("[GarlicMgr] recreate: mount new failed 0x%x\n", ret);
+         unlink(new_img); goto cleanup_extract;
+     }
+     snprintf(g_mounted_path, sizeof(g_mounted_path), "%s", new_img);
+     g_local_copy[0] = 0;
+     g_mounted = 1;
+
+     /* Copy extracted files into new container */
+     copy_dir_recursive(extract_dir, g_mount_point);
+     sync();
+
+     /* Unmount (re-encrypts) */
+     unmount_save();
+
+     /* Replace original image with the new one */
+     unlink(img);
+     ret = rename(new_img, img);
+     if (ret < 0) {
+         /* rename failed (cross-device?), try copy */
+         ret = copy_file(new_img, img);
+         unlink(new_img);
+     }
+
+     logprintf("[GarlicMgr] recreate: replaced %s with blob-free container\n", img);
+
+     /* Cleanup */
+     remove_dir_recursive(extract_dir);
+     return ret < 0 ? -1 : 0;
+
+ cleanup_extract:
+     remove_dir_recursive(extract_dir);
+     return -1;
  }
 
  static int sfo_all_zero_file(const char *path) {
@@ -2901,12 +3119,12 @@ static void compute_params_hmac(const uint8_t open_psid[16]) {
          memcpy(lh+18, &e->size, 4);
          memcpy(lh+22, &e->size, 4);
          memcpy(lh+26, &nlen, 2);
-         send(sock, lh, 30, 0);
-         send(sock, e->name, nlen, 0);
-         if (fdata) { send(sock, fdata, e->size, 0); free(fdata); }
+         send_all_fd(sock, lh, 30);
+         send_all_fd(sock, e->name, nlen);
+         if (fdata) { send_all_fd(sock, fdata, e->size); free(fdata); }
          offset += 30 + nlen + e->size;
      }
- 
+
      uint32_t cd_offset = offset;
      for (int i = 0; i < count; i++) {
          zip_entry_t *e = &entries[i];
@@ -2919,12 +3137,12 @@ static void compute_params_hmac(const uint8_t open_psid[16]) {
          memcpy(cd+24, &e->size, 4);
          memcpy(cd+28, &nlen, 2);
          memcpy(cd+42, &e->offset, 4);
-         send(sock, cd, 46, 0);
-         send(sock, e->name, nlen, 0);
+         send_all_fd(sock, cd, 46);
+         send_all_fd(sock, e->name, nlen);
          offset += 46 + nlen;
      }
      uint32_t cd_size = offset - cd_offset;
- 
+
      uint8_t ecd[22]; memset(ecd, 0, 22);
      ecd[0]=0x50; ecd[1]=0x4b; ecd[2]=0x05; ecd[3]=0x06;
      uint16_t cnt16 = (uint16_t)count;
@@ -2932,7 +3150,7 @@ static void compute_params_hmac(const uint8_t open_psid[16]) {
      memcpy(ecd+10, &cnt16, 2);
      memcpy(ecd+12, &cd_size, 4);
      memcpy(ecd+16, &cd_offset, 4);
-     send(sock, ecd, 22, 0);
+     send_all_fd(sock, ecd, 22);
      free(entries);
  }
  
@@ -2983,66 +3201,68 @@ static void compute_params_hmac(const uint8_t open_psid[16]) {
  static int zip_write_files(zip_sink_t *sink, const zip_file_t *files, int nfiles, char *iobuf) {
      zip_entry_t *entries = malloc(nfiles * sizeof(zip_entry_t));
      if (!entries) return -1;
- 
+
      uint32_t offset = 0;
      for (int i = 0; i < nfiles; i++) {
          zip_entry_t *e = &entries[i];
          snprintf(e->name, sizeof(e->name), "%s", files[i].name);
- 
+
          struct stat st;
          if (stat(files[i].path, &st) < 0) { e->size = 0; e->crc = 0; e->offset = offset; continue; }
          e->size = (uint32_t)st.st_size;
          e->offset = offset;
- 
+
+         /* Pass 1: compute CRC by reading the entire file */
          int fd = open(files[i].path, O_RDONLY);
-         if (fd < 0) { e->crc = 0; continue; }
- 
-         /* Stream: compute CRC while sending */
+         if (fd < 0) { e->size = 0; e->crc = 0; continue; }
+         {
+             uint32_t crc = 0xFFFFFFFF;
+             char *buf = iobuf;
+             ssize_t nr;
+             while ((nr = read(fd, buf, BUF_SIZE)) > 0) {
+                 for (ssize_t j = 0; j < nr; j++) {
+                     crc ^= (uint8_t)buf[j];
+                     for (int k = 0; k < 8; k++)
+                         crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
+                 }
+             }
+             crc ^= 0xFFFFFFFF;
+             e->crc = crc;
+         }
+         close(fd);
+
+         /* Write local file header with real CRC and sizes (no data descriptor) */
          uint16_t nlen = strlen(e->name);
-         /* Send local header with CRC=0, will use data descriptor */
          uint8_t lh[30]; memset(lh, 0, 30);
          lh[0]=0x50; lh[1]=0x4b; lh[2]=0x03; lh[3]=0x04;
          lh[4]=20;
-         lh[6]=0x08; /* flag: data descriptor follows — CRC+sizes must be 0 */
+         /* flags = 0 (no data descriptor) */
+         memcpy(lh+14, &e->crc, 4);
+         memcpy(lh+18, &e->size, 4);
+         memcpy(lh+22, &e->size, 4);
          memcpy(lh+26, &nlen, 2);
          if (zip_sink_write(sink, lh, 30) < 0 ||
              zip_sink_write(sink, e->name, nlen) < 0) {
+             free(entries);
+             return -1;
+         }
+
+         /* Pass 2: re-read and stream the file data */
+         fd = open(files[i].path, O_RDONLY);
+         if (fd >= 0) {
+             char *buf = iobuf;
+             ssize_t nr;
+             while ((nr = read(fd, buf, BUF_SIZE)) > 0) {
+                 if (zip_sink_write(sink, buf, (size_t)nr) < 0) {
+                     close(fd);
+                     free(entries);
+                     return -1;
+                 }
+             }
              close(fd);
-             free(entries);
-             return -1;
          }
- 
-         uint32_t crc = 0xFFFFFFFF;
-         char *buf = iobuf;
-         ssize_t nr;
-         while ((nr = read(fd, buf, BUF_SIZE)) > 0) {
-             for (ssize_t j = 0; j < nr; j++) {
-                 crc ^= (uint8_t)buf[j];
-                 for (int k = 0; k < 8; k++)
-                     crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
-             }
-             if (zip_sink_write(sink, buf, (size_t)nr) < 0) {
-                 close(fd);
-                 free(entries);
-                 return -1;
-             }
-         }
-         close(fd);
-         crc ^= 0xFFFFFFFF;
-         e->crc = crc;
- 
-         /* Data descriptor */
-         uint8_t dd[16];
-         dd[0]=0x50; dd[1]=0x4b; dd[2]=0x07; dd[3]=0x08;
-         memcpy(dd+4, &e->crc, 4);
-         memcpy(dd+8, &e->size, 4);
-         memcpy(dd+12, &e->size, 4);
-         if (zip_sink_write(sink, dd, 16) < 0) {
-             free(entries);
-             return -1;
-         }
- 
-         offset += 30 + nlen + e->size + 16;
+
+         offset += 30 + nlen + e->size;
      }
  
      uint32_t cd_offset = offset;
@@ -3088,7 +3308,24 @@ static void compute_params_hmac(const uint8_t open_psid[16]) {
      sink.bytes = 0;
      zip_write_files(&sink, files, nfiles, iobuf);
  }
- 
+
+ /* Compute the exact byte-size a zip_write_files() call will produce.
+  * Layout: local-header(30) + name + data per file,
+  * then central-dir(46+name) per file, then EOCD(22). */
+ static uint64_t zip_files_content_length(const zip_file_t *files, int nfiles) {
+     uint64_t total = 0;
+     for (int i = 0; i < nfiles; i++) {
+         struct stat st;
+         uint64_t fsize = 0;
+         if (stat(files[i].path, &st) == 0) fsize = (uint64_t)st.st_size;
+         uint16_t nlen = strlen(files[i].name);
+         total += 30 + nlen + fsize;   /* local header + data */
+         total += 46 + nlen;           /* central directory entry */
+     }
+     total += 22; /* EOCD */
+     return total;
+ }
+
  typedef struct {
      int is_title;
      int auto_job;
@@ -5790,15 +6027,17 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              };
              /* Check if .bin exists; if not, just send 1 file */
              int nfiles = (stat(bin_path, &st) == 0) ? 2 : 1;
- 
+             uint64_t zip_len = zip_files_content_length(zfiles, nfiles);
+
              char hdr[512];
              int hlen = snprintf(hdr, sizeof(hdr),
                  "HTTP/1.1 200 OK\r\n"
                  "Content-Type: application/zip\r\n"
                  "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                 "Content-Length: %llu\r\n"
                  "Access-Control-Allow-Origin: *\r\n"
                  "Connection: close\r\n"
-                 "\r\n", zip_name);
+                 "\r\n", zip_name, (unsigned long long)zip_len);
              send(sock, hdr, hlen, 0);
              zip_send_files(sock, zfiles, nfiles, iobuf);
          } else {
@@ -6128,9 +6367,11 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              g_mount_real_sfo_len = (uint32_t)g_ed_size;
              const char *img = g_local_copy[0] ? g_local_copy : g_mounted_path;
              if (img[0]) {
-                 int wr = ps5param_write_sfo(img, (const uint8_t *)g_ed_buf, (uint32_t)g_ed_size);
-                 logprintf("[GarlicMgr] Editor: wrote param.sfo blob back (%zu B) -> %d\n",
-                           g_ed_size, wr);
+                 /* Blob write will be replaced by container recreate at unmount.
+                  * The SFO is already saved in the PFS. Mark for recreate. */
+                 logprintf("[GarlicMgr] Editor: param.sfo saved to PFS (%zu B), "
+                           "container will be recreated at import to remove blob\n",
+                           g_ed_size);
              }
          }
          g_ed_dirty = 0;
@@ -6398,15 +6639,16 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              http_json(sock, json); return;
          }
  
-         /* Mount succeeded — return JSON with download URL instead of streaming zip
-          * on the same connection (avoids browser XHR issues with large blob responses) */
+         /* Mount succeeded — install the real param.sfo from the PS5PARAM blob
+          * into the PFS so the decrypted zip contains usable metadata.
+          * Without this the zip gets a zeroed param.sfo that breaks re-encrypt. */
          char sfo_path[MAX_PATH_LEN], json[256];
          sfo_info_t sfo;
          snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
-         /* System-save promotion requires the zeroed in-PFS SFO. Use PS5PARAM
-          * for display without modifying the mounted image. */
          if (!is_ps4_dec && g_mount_real_sfo_len &&
              sfo_bytes_valid(g_mount_real_sfo, g_mount_real_sfo_len)) {
+             install_sfo_file(sfo_path, g_mount_real_sfo, g_mount_real_sfo_len);
+             sync();
              parse_sfo_mem(g_mount_real_sfo, g_mount_real_sfo_len, &sfo);
              cache_params_hmac_mem(g_mount_real_sfo, g_mount_real_sfo_len);
          } else {
@@ -6801,13 +7043,13 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
             }
             logprintf("[GarlicMgr] PS5PARAM: restored original encrypted blob for zeroed param.sfo\n");
         } else if (has_ps5param_sidecar && enc_blob_sfo_len) {
-             int wr = ps5param_write_sfo(tmp, enc_blob_sfo, enc_blob_sfo_len);
-             if (wr < 0)
-                 logprintf("[GarlicMgr] WARNING: PS5PARAM blob write failed (%d); "
-                           "real param.sfo remains in the PFS\n", wr);
+             /* Blob write would corrupt the SBL-authenticated region.
+              * Recreate the container without a blob so PS5 reads SFO from PFS. */
+             int rc = recreate_container_no_blob(tmp, enc_blob_sfo, enc_blob_sfo_len);
+             if (rc < 0)
+                 logprintf("[GarlicMgr] WARNING: encrypt recreate failed (%d)\n", rc);
              else
-                 logprintf("[GarlicMgr] PS5PARAM: wrote real param.sfo (%u B) into image header\n",
-                           enc_blob_sfo_len);
+                 logprintf("[GarlicMgr] encrypt_upload: recreated container without blob\n");
          }
  
          struct stat est;
@@ -6905,13 +7147,15 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  { tmp,     img_name },
                  { bin_tmp, key_name }
              };
+             uint64_t zip_len = zip_files_content_length(zfiles, 2);
              char hdr[1024];
              int hlen = snprintf(hdr, sizeof(hdr),
                  "HTTP/1.1 200 OK\r\n"
                  "Content-Type: application/zip\r\n"
                  "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                 "Content-Length: %llu\r\n"
                  "Access-Control-Allow-Origin: *\r\n"
-                 "Connection: close\r\n\r\n", zip_name);
+                 "Connection: close\r\n\r\n", zip_name, (unsigned long long)zip_len);
              send(sock, hdr, hlen, 0);
              zip_send_files(sock, zfiles, 2, iobuf);
              unlink(tmp);
@@ -7285,11 +7529,35 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              }
          }
  
+         /* PS5: capture the final SFO for container recreate */
+         uint8_t dl_sfo[0x8000];
+         uint32_t dl_sfo_len = 0;
+         if (!g_enc_ps4) {
+             char dl_sfo_path[MAX_PATH_LEN];
+             snprintf(dl_sfo_path, sizeof(dl_sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
+             int rfd = open(dl_sfo_path, O_RDONLY);
+             if (rfd >= 0) {
+                 ssize_t rn = read(rfd, dl_sfo, sizeof(dl_sfo));
+                 close(rfd);
+                 if (rn > 0 && sfo_bytes_valid(dl_sfo, (size_t)rn))
+                     dl_sfo_len = (uint32_t)rn;
+             }
+         }
+
          /* Save path before unmount clears it */
          char tmp_path[MAX_PATH_LEN];
          snprintf(tmp_path, sizeof(tmp_path), "%s", g_mounted_path);
          unmount_save();
- 
+
+         /* PS5: recreate container without blob */
+         if (!g_enc_ps4 && dl_sfo_len && g_mount_real_sfo_len) {
+             int rc = recreate_container_no_blob(tmp_path, dl_sfo, dl_sfo_len);
+             if (rc < 0)
+                 logprintf("[GarlicMgr] WARNING: download_new recreate failed (%d)\n", rc);
+             else
+                 logprintf("[GarlicMgr] download_new: recreated container without blob\n");
+         }
+
          /* For PS4: write sealed key .bin companion file */
          if (g_enc_ps4) {
              const char *bin_tmp = "/data/save_files/_tmp_enc.bin";
@@ -7334,13 +7602,15 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  { tmp_path, img_name },
                  { bin_tmp,  key_name }
              };
+             uint64_t zip_len = zip_files_content_length(zfiles, 2);
              char hdr[1024];
              int hlen = snprintf(hdr, sizeof(hdr),
                  "HTTP/1.1 200 OK\r\n"
                  "Content-Type: application/zip\r\n"
                  "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                 "Content-Length: %llu\r\n"
                  "Access-Control-Allow-Origin: *\r\n"
-                 "Connection: close\r\n\r\n", zip_name);
+                 "Connection: close\r\n\r\n", zip_name, (unsigned long long)zip_len);
              send(sock, hdr, hlen, 0);
              zip_send_files(sock, zfiles, 2, iobuf);
              unlink(tmp_path);
@@ -7524,13 +7794,12 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          unmount_save();
  
          if (!is_ps4 && resign_sfo_len) {
-             int wr = ps5param_write_sfo(tmp, resign_sfo, resign_sfo_len);
-             if (wr < 0)
-                 logprintf("[GarlicMgr] WARNING: resign PS5PARAM blob write failed (%d); "
-                           "patched param.sfo remains in the PFS\n", wr);
+             int rc = recreate_container_no_blob(tmp, resign_sfo, resign_sfo_len);
+             if (rc < 0)
+                 logprintf("[GarlicMgr] WARNING: resign recreate failed (%d); "
+                           "patched param.sfo remains in the PFS\n", rc);
              else
-                 logprintf("[GarlicMgr] PS5PARAM: wrote resigned param.sfo (%u B) into image header\n",
-                           resign_sfo_len);
+                 logprintf("[GarlicMgr] resign: recreated container without blob\n");
          }
  
          /* Return JSON, file available via GET /api/resign_download */
@@ -7547,6 +7816,379 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          return;
      }
  
+     /* POST /api/resign_recreate?aid=<hex>&ps4=1&uid=<hex>
+      * -> upload encrypted save, create a FRESH container with patched account ID.
+      * This avoids the PS5PARAM blob/PFS mismatch that occurs when patching
+      * the blob in an existing container — the blob's SBL authentication
+      * cannot be replicated, so the PS5 rejects the patched blob.
+      * A new container has mode=0x00 (no blob), so the PS5 reads param.sfo
+      * from the PFS directly. */
+     if (strcmp(method, "POST") == 0 && strncmp(url, "/api/resign_recreate", 20) == 0) {
+         int is_ps4 = (strstr(url, "ps4=1") != NULL);
+
+         /* Parse account ID from query string */
+         char aid_hex[64] = {0};
+         char *ap = strstr(url, "aid=");
+         if (ap) {
+             strncpy(aid_hex, ap + 4, sizeof(aid_hex) - 1);
+             char *rp = aid_hex, *wp = aid_hex;
+             while (*rp && *rp != '&') {
+                 if (*rp == '%' && rp[1] && rp[2]) {
+                     char hex[3] = {rp[1], rp[2], 0};
+                     *wp++ = (char)strtol(hex, NULL, 16);
+                     rp += 3;
+                 } else { *wp++ = *rp++; }
+             }
+             *wp = 0;
+         }
+         char *hex_str = aid_hex;
+         if (hex_str[0] == '0' && (hex_str[1] == 'x' || hex_str[1] == 'X'))
+             hex_str += 2;
+         if (strlen(hex_str) != 16) {
+             http_json(sock, "{\"error\":\"Account ID must be 16 hex chars\"}");
+             return;
+         }
+         uint8_t new_aid[8];
+         if (sfo_account_from_hex(hex_str, new_aid) < 0) {
+             http_json(sock, "{\"error\":\"Invalid Account ID\"}"); return;
+         }
+
+         /* Parse uid */
+         uint32_t resign_uid = 0;
+         const uint32_t *resign_uid_ptr = NULL;
+         {
+             char *up = strstr(url, "uid=");
+             uint32_t uid = 0;
+             int have_uid = 0;
+             if (up) {
+                 char uid_hex[16] = {0};
+                 strncpy(uid_hex, up + 4, sizeof(uid_hex) - 1);
+                 char *rp2 = uid_hex, *wp2 = uid_hex;
+                 while (*rp2 && *rp2 != '&') {
+                     if (*rp2 == '%' && rp2[1] && rp2[2]) {
+                         char hx[3] = {rp2[1], rp2[2], 0};
+                         *wp2++ = (char)strtol(hx, NULL, 16);
+                         rp2 += 3;
+                     } else { *wp2++ = *rp2++; }
+                 }
+                 *wp2 = 0;
+                 char *us = uid_hex;
+                 if (us[0] == '0' && (us[1] == 'x' || us[1] == 'X')) us += 2;
+                 uid = (uint32_t)strtoul(us, NULL, 16);
+                 have_uid = 1;
+             }
+             if (!have_uid) {
+                 int local_uid = 0;
+                 if (sceUserServiceGetForegroundUser(&local_uid) == 0) {
+                     uid = (uint32_t)local_uid;
+                     have_uid = 1;
+                 }
+             }
+             if (have_uid) {
+                 resign_uid = uid;
+                 resign_uid_ptr = &resign_uid;
+             }
+         }
+
+         /* Receive body (encrypted save image) */
+         size_t clen = 0;
+         char *cl = strcasestr(req, "Content-Length:");
+         if (cl) clen = strtoul(cl + 15, NULL, 10);
+         if (clen == 0 || clen > (size_t)2 * 1024 * 1024 * 1024) {
+             http_json(sock, "{\"error\":\"Invalid size\"}"); return;
+         }
+         char *body_start = strstr(req, "\r\n\r\n");
+         if (!body_start) { http_json(sock, "{\"error\":\"Bad request\"}"); return; }
+         body_start += 4;
+         size_t body_in_buf = n - (body_start - req);
+
+         mkdir("/data/save_files", 0777);
+         const char *src_img = "/data/save_files/_tmp_resign_src";
+         if (is_ps4) src_img = "/data/save_files/sdimg__tmp_resign_src";
+         int fd = open(src_img, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+         if (fd < 0) { http_json(sock, "{\"error\":\"Cannot create temp file\"}"); return; }
+         if (body_in_buf > clen) body_in_buf = clen;
+         write(fd, body_start, body_in_buf);
+         size_t received = body_in_buf;
+         while (received < clen) {
+             char *buf = iobuf;
+             size_t want = BUF_SIZE < (clen - received) ? BUF_SIZE : (clen - received);
+             ssize_t r = recv_all(sock, buf, want);
+             if (r <= 0) break;
+             write(fd, buf, r);
+             received += r;
+         }
+         close(fd);
+         printf("[GarlicMgr] resign_recreate: received %zu bytes (ps4=%d)\n", received, is_ps4);
+
+         /* For PS4: rename uploaded .bin key to match image name */
+         if (is_ps4) {
+             rename("/data/save_files/_tmp_key.bin", "/data/save_files/_tmp_resign_src.bin");
+         }
+
+         /* Step 1: Mount source save (to extract files) */
+         int ret = mount_by_path(src_img);
+         if (ret < 0) {
+             unlink(src_img);
+             if (is_ps4) unlink("/data/save_files/_tmp_resign_src.bin");
+             char json[128];
+             snprintf(json, sizeof(json), "{\"error\":\"Mount source failed: %d\"}", ret);
+             http_json(sock, json); return;
+         }
+
+         /* PS5: restore real metadata from the header blob (in-PFS is zero) */
+         char sfo_path[MAX_PATH_LEN];
+         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
+         if (!is_ps4 && g_mount_real_sfo_len &&
+             sfo_bytes_valid(g_mount_real_sfo, g_mount_real_sfo_len)) {
+             if (install_sfo_file(sfo_path, g_mount_real_sfo, g_mount_real_sfo_len) == 0)
+                 cache_params_hmac_mem(g_mount_real_sfo, g_mount_real_sfo_len);
+         }
+
+         /* Parse SFO to get save info */
+         sfo_info_t sfo;
+         if (parse_sfo(sfo_path, &sfo) < 0 || !sfo.title_id[0]) {
+             unmount_save();
+             unlink(src_img);
+             if (is_ps4) unlink("/data/save_files/_tmp_resign_src.bin");
+             http_json(sock, "{\"error\":\"Cannot parse param.sfo from source\"}"); return;
+         }
+
+         /* Step 2: Copy all files from mounted PFS to a temp directory */
+         const char *extract_dir = "/data/save_files/_tmp_resign_extract";
+         remove_dir_recursive(extract_dir);
+         mkdir(extract_dir, 0777);
+         copy_dir_recursive(g_mount_point, extract_dir);
+         sync();
+         printf("[GarlicMgr] resign_recreate: extracted files from source to %s\n", extract_dir);
+
+         /* Calculate total size of extracted files */
+         uint64_t total_size = 0;
+         {
+             DIR *sd = opendir(extract_dir);
+             if (sd) {
+                 struct dirent *se;
+                 while ((se = readdir(sd))) {
+                     if (se->d_name[0] == '.') continue;
+                     char fp[MAX_PATH_LEN];
+                     snprintf(fp, sizeof(fp), "%s/%s", extract_dir, se->d_name);
+                     struct stat fst;
+                     if (stat(fp, &fst) == 0) {
+                         if (S_ISDIR(fst.st_mode)) {
+                             DIR *sub = opendir(fp);
+                             if (sub) {
+                                 struct dirent *sse;
+                                 while ((sse = readdir(sub))) {
+                                     if (sse->d_name[0] == '.') continue;
+                                     char sfp[MAX_PATH_LEN];
+                                     snprintf(sfp, sizeof(sfp), "%s/%s", fp, sse->d_name);
+                                     struct stat sfst;
+                                     if (stat(sfp, &sfst) == 0) total_size += sfst.st_size;
+                                 }
+                                 closedir(sub);
+                             }
+                         } else {
+                             total_size += fst.st_size;
+                         }
+                     }
+                 }
+                 closedir(sd);
+             }
+         }
+         if (total_size == 0) total_size = 1024 * 1024;
+
+         /* Unmount source */
+         unmount_save();
+         printf("[GarlicMgr] resign_recreate: unmounted source\n");
+
+         /* Step 3: Create new PFS image */
+         uint64_t img_size = total_size + (total_size / 4) + (4 * 1024 * 1024);
+         if (img_size < 32 * 1024 * 1024) img_size = 32 * 1024 * 1024;
+         /* If original image is larger, use that size to be safe */
+         {
+             struct stat orig_st;
+             if (stat(src_img, &orig_st) == 0 && (uint64_t)orig_st.st_size > img_size)
+                 img_size = (uint64_t)orig_st.st_size;
+         }
+         img_size = ((img_size + 32767) / 32768) * 32768;
+
+         const char *new_img = "/data/save_files/_tmp_resign";
+         if (is_ps4) new_img = "/data/save_files/sdimg__tmp_resign";
+         unlink(new_img);
+
+         pid_t rpid = getpid();
+         kernel_set_ucred_uid(rpid, 0);
+         kernel_set_ucred_authid(rpid, 0x4800000000000010ULL);
+
+         int imgfd = open(new_img, O_CREAT | O_TRUNC | O_RDWR, 0777);
+         if (imgfd < 0) {
+             unlink(src_img);
+             if (is_ps4) unlink("/data/save_files/_tmp_resign_src.bin");
+             http_json(sock, "{\"error\":\"Cannot create new image file\"}"); return;
+         }
+         ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0, 0);
+         if (ret < 0) {
+             if (ftruncate(imgfd, img_size) < 0) {
+                 close(imgfd); unlink(new_img); unlink(src_img);
+                 if (is_ps4) unlink("/data/save_files/_tmp_resign_src.bin");
+                 http_json(sock, "{\"error\":\"Cannot allocate new image\"}"); return;
+             }
+         }
+         close(imgfd);
+         printf("[GarlicMgr] resign_recreate: created new image %llu bytes\n",
+                (unsigned long long)img_size);
+
+         uint8_t ckey[0x20] = {0};
+
+         if (is_ps4) {
+             /* PS4: generate sealed key, decrypt it */
+             uint8_t *kbuf = malloc(0x100);
+             if (!kbuf) {
+                 unlink(new_img); unlink(src_img);
+                 http_json(sock, "{\"error\":\"Out of memory\"}"); return;
+             }
+             memset(kbuf, 0, 0x100);
+             int gen_ok = 0;
+             int kfd = open("/dev/sbl_srv", O_RDWR);
+             if (kfd >= 0) {
+                 if (ioctl(kfd, 0x40845303, kbuf) >= 0) gen_ok = 1;
+                 close(kfd);
+             }
+             if (!gen_ok) {
+                 memset(kbuf, 0, 0x100);
+                 kfd = open("/dev/pfsmgr", O_RDWR);
+                 if (kfd >= 0) {
+                     if (ioctl(kfd, 0x40845303, kbuf) >= 0) gen_ok = 1;
+                     close(kfd);
+                 }
+             }
+             if (!gen_ok) {
+                 free(kbuf); unlink(new_img); unlink(src_img);
+                 http_json(sock, "{\"error\":\"Cannot generate sealed key\"}"); return;
+             }
+             memcpy(g_sealed_key, kbuf, 96);
+
+             /* Decrypt sealed key */
+             memset(kbuf, 0, 0x100);
+             memcpy(kbuf, g_sealed_key, 96);
+             int pfsmgr = open("/dev/pfsmgr", O_RDWR);
+             if (pfsmgr < 0) {
+                 free(kbuf); unlink(new_img); unlink(src_img);
+                 http_json(sock, "{\"error\":\"Cannot open pfsmgr\"}"); return;
+             }
+             ret = ioctl(pfsmgr, 0xc0845302, kbuf);
+             close(pfsmgr);
+             if (ret < 0) {
+                 free(kbuf); unlink(new_img); unlink(src_img);
+                 http_json(sock, "{\"error\":\"Cannot decrypt sealed key\"}"); return;
+             }
+             memcpy(ckey, kbuf + 0x60, 0x20);
+             free(kbuf);
+
+             /* Format with non-Ppr create */
+             CreateOpt copt;
+             memset(&copt, 0, sizeof(copt));
+             sceFsInitCreatePfsSaveDataOpt(&copt);
+             ret = sceFsCreatePfsSaveDataImage(&copt, new_img, 0, img_size, ckey);
+         } else {
+             /* PS5: PprCreate with zeroed key (no blob) */
+             CreateOpt copt;
+             memset(&copt, 0, sizeof(copt));
+             sceFsInitCreatePfsSaveDataOpt(&copt);
+             copt.flags[1] = 0;
+             if (!g_pprCreate) {
+                 unlink(new_img); unlink(src_img);
+                 http_json(sock, "{\"error\":\"PprCreate not available\"}"); return;
+             }
+             ret = g_pprCreate(&copt, new_img, 0, img_size, ckey);
+         }
+         if (ret < 0) {
+             unlink(new_img); unlink(src_img);
+             if (is_ps4) unlink("/data/save_files/_tmp_resign_src.bin");
+             char json[128];
+             snprintf(json, sizeof(json), "{\"error\":\"Format new PFS failed: 0x%x\"}", ret);
+             http_json(sock, json); return;
+         }
+         printf("[GarlicMgr] resign_recreate: formatted new PFS (%s)\n",
+                is_ps4 ? "PS4" : "PS5");
+
+         /* Step 4: Mount new container */
+         if (g_mounted) unmount_save();
+         snprintf(g_mount_point, sizeof(g_mount_point), "/data/mount_sd");
+         mkdir(g_mount_point, 0777);
+         MountOpt mopt;
+         memset(&mopt, 0, sizeof(mopt));
+         sceFsInitMountSaveDataOpt(&mopt);
+         mopt.budgetid = "system";
+         signal(SIGPIPE, SIG_DFL);
+         ret = sceFsMountSaveData(&mopt, new_img, g_mount_point, ckey);
+         signal(SIGPIPE, SIG_IGN);
+         if (ret < 0) {
+             unlink(new_img); unlink(src_img);
+             if (is_ps4) unlink("/data/save_files/_tmp_resign_src.bin");
+             char json[128];
+             snprintf(json, sizeof(json), "{\"error\":\"Mount new PFS failed: 0x%x\"}", ret);
+             http_json(sock, json); return;
+         }
+         snprintf(g_mounted_path, sizeof(g_mounted_path), "%s", new_img);
+         g_local_copy[0] = 0;
+         g_mounted = 1;
+         printf("[GarlicMgr] resign_recreate: mounted new PFS\n");
+
+         /* Step 5: Copy extracted files into new container */
+         copy_dir_recursive(extract_dir, g_mount_point);
+         sync();
+         printf("[GarlicMgr] resign_recreate: copied files into new container\n");
+
+         /* Step 6: Patch account ID in PFS param.sfo directly (no blob) */
+         char new_sfo_path[MAX_PATH_LEN];
+         snprintf(new_sfo_path, sizeof(new_sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
+         int owner_ret = is_ps4 ? (resign_uid_ptr ?
+             patch_local_sfo_owner(new_sfo_path, new_aid, resign_uid, 1) : -1) :
+             patch_sfo_account(new_sfo_path, new_aid, resign_uid_ptr);
+         if (owner_ret < 0) {
+             unmount_save();
+             unlink(new_img); unlink(src_img);
+             if (is_ps4) unlink("/data/save_files/_tmp_resign_src.bin");
+             remove_dir_recursive(extract_dir);
+             http_json(sock, "{\"error\":\"Cannot patch account ID in new container\"}"); return;
+         }
+         printf("[GarlicMgr] resign_recreate: patched account ID to %s (%s)\n",
+                aid_hex, is_ps4 ? "PS4" : "PS5");
+
+         /* Step 7: Unmount (re-encrypts PFS with new key) */
+         unmount_save();
+         printf("[GarlicMgr] resign_recreate: unmounted new container\n");
+
+         /* Clean up source and extract dir */
+         unlink(src_img);
+         if (is_ps4) unlink("/data/save_files/_tmp_resign_src.bin");
+         remove_dir_recursive(extract_dir);
+
+         /* PS4: write .bin sealed key companion for new image */
+         if (is_ps4) {
+             const char *bin_tmp = "/data/save_files/_tmp_resign.bin";
+             int bfd = open(bin_tmp, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+             if (bfd >= 0) {
+                 write(bfd, g_sealed_key, 96);
+                 close(bfd);
+             }
+         }
+
+         /* Return JSON, file available via GET /api/resign_download */
+         struct stat st;
+         if (stat(new_img, &st) < 0) {
+             unlink(new_img);
+             if (is_ps4) unlink("/data/save_files/_tmp_resign.bin");
+             http_json(sock, "{\"error\":\"Recreated file not found\"}"); return;
+         }
+         char json[128];
+         snprintf(json, sizeof(json), "{\"ok\":true,\"size\":%lld,\"ps4\":%s,\"recreated\":true}",
+                  (long long)st.st_size, is_ps4 ? "true" : "false");
+         http_json(sock, json);
+         return;
+     }
+
      /* GET /api/import_check?uid=<hex> -> check if mounted save already exists on system */
      if (strcmp(method, "GET") == 0 && strncmp(url, "/api/import_check", 17) == 0) {
          if (!g_mounted) { http_json(sock, "{\"error\":\"No save mounted\"}"); return; }
@@ -7743,13 +8385,12 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              }
              unmount_save();
              if (usb_sfo_len) {
-                 int wr = ps5param_write_sfo(tmp_path, usb_sfo, usb_sfo_len);
-                 if (wr < 0)
-                     logprintf("[GarlicMgr] WARNING: import_usb blob write failed (%d); "
-                               "patched param.sfo remains in the PFS\n", wr);
+                 int rc = recreate_container_no_blob(tmp_path, usb_sfo, usb_sfo_len);
+                 if (rc < 0)
+                     logprintf("[GarlicMgr] WARNING: import_usb recreate failed (%d); "
+                               "patched param.sfo remains in the PFS\n", rc);
                  else
-                     logprintf("[GarlicMgr] PS5PARAM: wrote imported param.sfo (%u B) into image header\n",
-                               usb_sfo_len);
+                     logprintf("[GarlicMgr] import_usb: recreated container without blob\n");
              }
  
              /* Copy to system */
@@ -8156,15 +8797,11 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          /* Unmount (re-encrypts) */
          unmount_save();
  
-         if (!is_ps4 && usbimp_sfo_len) {
-             int wr = ps5param_write_sfo(tmp, usbimp_sfo, usbimp_sfo_len);
-             if (wr < 0)
-                 logprintf("[GarlicMgr] WARNING: import_usb (folder) blob write failed (%d); "
-                           "real param.sfo remains in the PFS\n", wr);
-             else
-                 logprintf("[GarlicMgr] PS5PARAM: wrote imported param.sfo (%u B) into new image header\n",
-                           usbimp_sfo_len);
-         }
+         /* New container created by PprCreate has no blob (mode=0x00).
+          * The SFO lives in the PFS; no blob write needed. */
+         if (!is_ps4 && usbimp_sfo_len)
+             logprintf("[GarlicMgr] import_usb (folder): fresh container, SFO in PFS (%u B), no blob needed\n",
+                       usbimp_sfo_len);
  
          /* Copy encrypted image to system save location */
          char sd_dir[MAX_PATH_LEN], sd_dst[MAX_PATH_LEN];
@@ -8485,13 +9122,12 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          unmount_save();
  
          if (!g_enc_ps4 && imp_sfo_len) {
-             int wr = ps5param_write_sfo(tmp_path, imp_sfo, imp_sfo_len);
-             if (wr < 0)
-                 logprintf("[GarlicMgr] WARNING: import_finish blob write failed (%d); "
-                           "real param.sfo remains in the PFS\n", wr);
+             int rc = recreate_container_no_blob(tmp_path, imp_sfo, imp_sfo_len);
+             if (rc < 0)
+                 logprintf("[GarlicMgr] WARNING: import_finish recreate failed (%d); "
+                           "patched param.sfo remains in the PFS\n", rc);
              else
-                 logprintf("[GarlicMgr] PS5PARAM: wrote imported param.sfo (%u B) into image header\n",
-                           imp_sfo_len);
+                 logprintf("[GarlicMgr] import_finish: recreated container without blob\n");
          }
  
          /* Flush kernel ioctl blob write to disk before copy_file reads it */
@@ -8824,16 +9460,18 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  
          char zip_name[128];
          snprintf(zip_name, sizeof(zip_name), "%s_saves.zip", tid);
+         uint64_t zip_len = zip_files_content_length(zfiles, nfiles);
          char hdr[512];
          int hlen = snprintf(hdr, sizeof(hdr),
              "HTTP/1.1 200 OK\r\n"
              "Content-Type: application/zip\r\n"
              "Content-Disposition: attachment; filename=\"%s\"\r\n"
+             "Content-Length: %llu\r\n"
              "Access-Control-Allow-Origin: *\r\n"
-             "Connection: close\r\n\r\n", zip_name);
+             "Connection: close\r\n\r\n", zip_name, (unsigned long long)zip_len);
          send(sock, hdr, hlen, 0);
          zip_send_files(sock, zfiles, nfiles, iobuf);
- 
+
          for (int i = 0; i < nfiles; i++) free(names[i]);
          for (int i = 0; i < nallocs; i++) free(allocs[i]);
          free(names); free(zfiles); free(allocs);
@@ -9019,13 +9657,21 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          /* Stream the combined zip */
          char zip_name[128];
          snprintf(zip_name, sizeof(zip_name), "%s_saves_dec.zip", tid);
+         /* Compute Content-Length: local headers + data + central dir + EOCD */
+         uint64_t dec_zip_len = 22; /* EOCD */
+         for (int i = 0; i < total; i++) {
+             uint16_t nl = strlen(all_entries[i].name);
+             dec_zip_len += 30 + nl + all_entries[i].size; /* local header + data */
+             dec_zip_len += 46 + nl;                       /* central dir entry */
+         }
          char hdr[512];
          int hlen = snprintf(hdr, sizeof(hdr),
              "HTTP/1.1 200 OK\r\n"
              "Content-Type: application/zip\r\n"
              "Content-Disposition: attachment; filename=\"%s\"\r\n"
+             "Content-Length: %llu\r\n"
              "Access-Control-Allow-Origin: *\r\n"
-             "Connection: close\r\n\r\n", zip_name);
+             "Connection: close\r\n\r\n", zip_name, (unsigned long long)dec_zip_len);
          send(sock, hdr, hlen, 0);
  
          uint32_t offset = 0;
@@ -9041,12 +9687,12 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              memcpy(lh+18, &e->size, 4);
              memcpy(lh+22, &e->size, 4);
              memcpy(lh+26, &nlen, 2);
-             send(sock, lh, 30, 0);
-             send(sock, e->name, nlen, 0);
-             if (e->data) { send(sock, e->data, e->size, 0); free(e->data); }
+             send_all_fd(sock, lh, 30);
+             send_all_fd(sock, e->name, nlen);
+             if (e->data) { send_all_fd(sock, e->data, e->size); free(e->data); }
              offset += 30 + nlen + e->size;
          }
- 
+
          uint32_t cd_offset = offset;
          for (int i = 0; i < total; i++) {
              dec_entry_t *e = &all_entries[i];
@@ -9059,8 +9705,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              memcpy(cd+24, &e->size, 4);
              memcpy(cd+28, &nlen, 2);
              memcpy(cd+42, &e->offset, 4);
-             send(sock, cd, 46, 0);
-             send(sock, e->name, nlen, 0);
+             send_all_fd(sock, cd, 46);
+             send_all_fd(sock, e->name, nlen);
              offset += 46 + nlen;
          }
          uint32_t cd_size = offset - cd_offset;
@@ -9072,8 +9718,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          memcpy(ecd+10, &cnt16, 2);
          memcpy(ecd+12, &cd_size, 4);
          memcpy(ecd+16, &cd_offset, 4);
-         send(sock, ecd, 22, 0);
- 
+         send_all_fd(sock, ecd, 22);
+
          free(all_entries);
          return;
      }
