@@ -7029,6 +7029,13 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          int use_original = preserved_size &&
              stat(original_path, &original_st) == 0 &&
              original_st.st_size == preserved_size;
+
+         /* Declared at wider scope so the post-unmount restore can
+          * access them regardless of which branch (use_original or
+          * fresh container) was taken. */
+         uint8_t orig_sealed_key[0x60];
+         int have_orig_key = 0;
+
          if (use_original) {
              if (g_mounted) unmount_save();
              logprintf("[GarlicMgr] original PFS source=%s destination=%s\n", original_path, tmp);
@@ -7036,6 +7043,26 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  free(tar_data); unlink(tmp);
                  http_json(sock, "{\"error\":\"Cannot copy original PFS image\"}");
                  return;
+             }
+             /* Save the original sealed key before mounting.  The kernel may
+              * re-seal the key during unmount, changing the 96-byte value at
+              * offset 0x800.  If the original PS5PARAM blob is later restored
+              * at 0xC00, the blob's crypto binding must match the sealed key
+              * at 0x800 — otherwise the PS5 rejects the save with
+              * CE-107136-8 (decryptSealedKey ret=0xffffffcb). */
+             {
+                 int skfd = open(tmp, O_RDONLY);
+                 if (skfd >= 0) {
+                     if (pread(skfd, orig_sealed_key, 0x60, 0x800) == 0x60) {
+                         /* Check it's not all zeros */
+                         for (int i = 0; i < 0x60; i++) {
+                             if (orig_sealed_key[i]) { have_orig_key = 1; break; }
+                         }
+                     }
+                     close(skfd);
+                 }
+                 if (have_orig_key)
+                     logprintf("[GarlicMgr] encrypt_upload: saved original sealed key\n");
              }
              ret = mount_by_path(tmp);
              if (ret < 0) {
@@ -7212,12 +7239,27 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          }
  
          unmount_save();
- 
+
+         /* Restore the original sealed key at 0x800.  The kernel may have
+          * re-sealed it during unmount, producing a different 96-byte value.
+          * The PS5PARAM blob at 0xC00 was encrypted by the SBL using the
+          * original sealed key, so both must stay paired — otherwise
+          * RestoreBackupData fails with decryptSealedKey ret=0xffffffcb. */
+         if (have_orig_key) {
+             int skfd = open(tmp, O_RDWR);
+             if (skfd >= 0) {
+                 pwrite(skfd, orig_sealed_key, 0x60, 0x800);
+                 fsync(skfd);
+                 close(skfd);
+                 logprintf("[GarlicMgr] encrypt_upload: restored original sealed key at 0x800\n");
+             }
+         }
+
          /* Restore original PS5PARAM blob when the save had one.
-          * The blob contains the sealed key and crypto-authenticated metadata
-          * that the PS5 validates during RestoreBackupData.  Recreating the
-          * container without the blob (PprCreate + zero key) causes the PS5
-          * to reject the save with CE-107136-8 (0x809F800A). */
+          * The blob contains crypto-authenticated metadata that the PS5
+          * validates during RestoreBackupData.  Recreating the container
+          * without the blob (PprCreate + zero key) causes the PS5 to reject
+          * the save with CE-107136-8 (0x809F800A). */
          if (preserve_sidecar) {
             int wr = ps5param_restore_blob(tmp, "/data/save_files/_ps5param_sidecar");
             if (wr < 0) {
@@ -7746,19 +7788,50 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          /* Save path before unmount clears it */
          char tmp_path[MAX_PATH_LEN];
          snprintf(tmp_path, sizeof(tmp_path), "%s", g_mounted_path);
+
+         /* Save the original sealed key (96 bytes at 0x800) before unmount.
+          * The kernel may re-seal it during unmount, breaking the crypto
+          * binding with the PS5PARAM blob at 0xC00. */
+         uint8_t orig_sealed_key[0x60];
+         int have_orig_key = 0;
+         if (!g_enc_ps4) {
+             int skfd = open(tmp_path, O_RDONLY);
+             if (skfd >= 0) {
+                 if (pread(skfd, orig_sealed_key, 0x60, 0x800) == 0x60) {
+                     for (int i = 0; i < 0x60; i++) {
+                         if (orig_sealed_key[i]) { have_orig_key = 1; break; }
+                     }
+                 }
+                 close(skfd);
+             }
+             if (have_orig_key)
+                 logprintf("[GarlicMgr] download_new: saved original sealed key\n");
+         }
+
          unmount_save();
+
+         /* Restore the original sealed key at 0x800 after unmount. */
+         if (have_orig_key) {
+             int skfd = open(tmp_path, O_RDWR);
+             if (skfd >= 0) {
+                 pwrite(skfd, orig_sealed_key, 0x60, 0x800);
+                 fsync(skfd);
+                 close(skfd);
+                 logprintf("[GarlicMgr] download_new: restored original sealed key at 0x800\n");
+             }
+         }
 
          /* PS5: restore original blob when the save had one, or recreate
           * when the container is undersized for SAVEDATA_BLOCKS.
-          * Restoring the blob preserves the sealed key and crypto metadata
-          * the PS5 needs during RestoreBackupData — without it the PS5
-          * rejects the save with CE-107136-8 (0x809F800A). */
+          * Restoring the blob preserves the crypto metadata the PS5 needs
+          * during RestoreBackupData — without it the PS5 rejects the save
+          * with CE-107136-8 (0x809F800A). */
          if (!g_enc_ps4 && dl_sfo_len) {
              struct stat pst;
              int has_sidecar = (stat("/data/save_files/_ps5param_sidecar", &pst) == 0 &&
                                 pst.st_size == 0x8000);
              if (g_mount_real_sfo_len && has_sidecar) {
-                 /* Restore the original blob — it has the authentic sealed key */
+                 /* Restore the original blob */
                  int wr = ps5param_restore_blob(tmp_path, "/data/save_files/_ps5param_sidecar");
                  if (wr < 0)
                      logprintf("[GarlicMgr] WARNING: download_new blob restore failed\n");
